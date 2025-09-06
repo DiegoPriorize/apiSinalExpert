@@ -1,12 +1,12 @@
 from typing import List, Literal, Optional, Union
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 import numpy as np
 from datetime import datetime, timezone
 
-app = FastAPI(title="OHLCV 1m Signal API", version="1.1")
+app = FastAPI(title="OHLCV 1m Signal API", version="1.2")
 
-# ------------------ Helpers ------------------
+# ------------------ Utils ------------------
 def _to_np(x):
     return np.asarray(x, dtype=float)
 
@@ -78,28 +78,56 @@ def sma(arr: np.ndarray, period: int):
         if len(arr)>0:
             out[:] = np.mean(arr)
         return out
-    kernel = np.ones(period)/period
-    return np.convolve(arr, kernel, mode='same')
+    return np.convolve(arr, np.ones(period)/period, mode='same')
 
-# ------------------ Sinal ------------------
+# ------------------ Core ------------------
 def compute_signal(t, o, h, l, c, v):
     t = np.array(t, dtype=float)
-    # Normaliza timestamps em ms -> s, se necessário
-    if np.nanmedian(t) > 1e11:  # heurística: ms têm ~13 dígitos
+    # Normaliza timestamps ms -> s, se necessário
+    if np.nanmedian(t) > 1e11:
         t = t / 1000.0
 
     o = _to_np(o); h = _to_np(h); l = _to_np(l); c = _to_np(c); v = _to_np(v)
     assert len(t)==len(o)==len(h)==len(l)==len(c)==len(v), "Arrays com tamanhos diferentes."
     n = len(c)
-    if n < 60:
-        raise ValueError("Forneça pelo menos 60 candles para estabilidade dos indicadores.")
 
-    ema9 = ema(c, 9); ema21 = ema(c, 21)
-    rsi14 = rsi(c, 14)
-    macd_line, signal_line, hist = macd(c, 12, 26, 9)
-    bb_ma, bb_up, bb_lo = bollinger(c, 20, 2.0)
-    atr14 = atr(h, l, c, 14)
-    vma20 = sma(v, 20)
+    # Mínimo exigido
+    if n < 50:
+        raise HTTPException(status_code=422, detail="Forneça pelo menos 50 candles (timestamp/open/high/low/close/volume).")
+
+    # Períodos: adaptativos em 50–59, padrão em >=60
+    if n < 60:
+        ema_fast_p = max(6, min(9,  n//3))     # alvo ~9
+        ema_slow_p = max(12, min(21, n//2))    # alvo ~21
+        rsi_p      = max(8, min(14, n//4))     # alvo ~14
+        macd_fast  = max(8, min(12, n//4))     # alvo ~12
+        macd_slow  = max(16, min(26, n//2))    # alvo ~26
+        macd_sig   = max(5, min(9,  n//6))     # alvo ~9
+        bb_p       = max(14, min(20, n//2))    # alvo ~20
+        atr_p      = max(8, min(14, n//4))     # alvo ~14
+        vma_p      = max(12, min(20, n//3))    # alvo ~20
+    else:
+        ema_fast_p, ema_slow_p = 9, 21
+        rsi_p = 14
+        macd_fast, macd_slow, macd_sig = 12, 26, 9
+        bb_p = 20
+        atr_p = 14
+        vma_p = 20
+
+    # Indicadores
+    ema9  = ema(c, ema_fast_p)
+    ema21 = ema(c, ema_slow_p)
+    rsi14 = rsi(c, rsi_p)
+
+    ema_fast = ema(c, macd_fast)
+    ema_slow = ema(c, macd_slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, macd_sig)
+    hist = macd_line - signal_line
+
+    bb_ma, bb_up, bb_lo = bollinger(c, bb_p, 2.0)
+    atr14 = atr(h, l, c, atr_p)
+    vma20 = sma(v, vma_p)
 
     i = n - 1
     score = 0.0
@@ -126,6 +154,7 @@ def compute_signal(t, o, h, l, c, v):
     if body > 0 and body_pct > 0.5: score += weights["price_action"]*0.5
     elif body < 0 and body_pct > 0.5: score -= weights["price_action"]*0.5
 
+    # Decisão
     buy_th, sell_th = 1.5, -1.5
     if score >= buy_th: action = "COMPRA"
     elif score <= sell_th: action = "VENDA"
@@ -133,10 +162,11 @@ def compute_signal(t, o, h, l, c, v):
 
     next_ts = int(t[i] + 60)
 
-    # Backtest leve (walk-forward)
-    window = min(500, n-30)
+    # Backtest adaptativo (usa até 500, mas garante >=8 comparações quando possível)
+    window = max(8, min(500, n-2))
+    start = max(1, n - window - 1)
     correct = 0; total = 0
-    for j in range(n - window - 1, n - 1):
+    for j in range(start, n - 1):
         sc = 0.0
         sc += weights["trend"] if ema9[j] > ema21[j] else -weights["trend"]
         if rsi14[j] >= 55: sc += weights["momentum"]
@@ -164,17 +194,17 @@ def compute_signal(t, o, h, l, c, v):
 
 # ------------------ Models ------------------
 class OHLCVPayload(BaseModel):
-    # Agora aceita lista OU string CSV
-    timestamp: Union[List[float], str] = Field(..., description="Unix seconds (1m). Pode ser lista JSON ou CSV string.")
+    # Aceita lista OU string CSV
+    timestamp: Union[List[float], str] = Field(..., description="Unix seconds (1m). Lista JSON ou CSV string.")
     open: Union[List[float], str]
     high: Union[List[float], str]
     low: Union[List[float], str]
     close: Union[List[float], str]
     volume: Union[List[float], str]
-    symbol: Optional[str] = Field(default=None)
+    symbol: Optional[str] = None
     timeframe: Literal["1m"] = "1m"
 
-    # pré-validador: converte CSV -> lista de float
+    # converter CSV -> lista de float
     @field_validator("timestamp", "open", "high", "low", "close", "volume", mode="before")
     @classmethod
     def _parse_csv(cls, v):
@@ -197,7 +227,7 @@ def signal(payload: OHLCVPayload):
     action, next_ts, acc, conf, score = compute_signal(
         payload.timestamp, payload.open, payload.high, payload.low, payload.close, payload.volume
     )
-    last_ts = int(_to_np(payload.timestamp)[-1] if len(payload.timestamp)>0 else next_ts-60)
+    last_ts = int(_to_np(payload.timestamp)[-1])
     decision_iso = datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat()
     return SignalResponse(
         symbol=payload.symbol,
