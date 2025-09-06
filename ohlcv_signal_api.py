@@ -210,18 +210,3 @@ def signal(payload: OHLCVPayload):
         confidence_pct=conf,
         score=round(float(score), 3),
     )
-Exemplo de payloads que agora funcionam
-CSV string (o que você tem no FlutterFlow hoje):
-
-json
-Copiar código
-{
-  "symbol": "BTCUSDT",
-  "timeframe": "1m",
-  "timestamp": "1757177940,1757178000,1757178060",
-  "open": "110292.9,110268.0,110251.0",
-  "high": "110298.0,110276.0,110270.0",
-  "low": "110262.0,110231.0,110240.0",
-  "close": "110268.0,110233.0,110260.0",
-  "volume": "8.73635,7.96036,3.7105"
-}
